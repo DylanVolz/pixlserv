@@ -4,16 +4,18 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"code.google.com/p/goauth2/oauth/jwt"
-	gcs "code.google.com/p/google-api-go-client/storage/v1beta1"
 	"github.com/mitchellh/goamz/aws"
 	"github.com/mitchellh/goamz/s3"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+	gcs "google.golang.org/api/storage/v1beta1"
 )
 
 const (
@@ -228,13 +230,33 @@ type gcsStorage struct {
 }
 
 func (s *gcsStorage) init() error {
-	jwtToken := jwt.NewToken(os.Getenv(gcsIssEnvVar), gcs.DevstorageRead_writeScope, []byte(os.Getenv(gcsKeyEnvVar)))
-	oauthToken, err := jwtToken.Assert(http.DefaultClient)
+	// Your credentials should be obtained from the Google
+	// Developer Console (https://console.developers.google.com).
+	// Navigate to your project, then see the "Credentials" page
+	// under "APIs & Auth".
+	// To create a service account client, click "Create new Client ID",
+	// select "Service Account", and click "Create Client ID". A JSON
+	// key file will then be downloaded to your computer.
+	data, err := ioutil.ReadFile("/path/to/your-project-key.json")
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
+	conf, err := google.JWTConfigFromJSON(data, gcs.DevstorageReadWriteScope)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Initiate an http.Client. The following GET request will be
+	// authorized and authenticated on the behalf of
+	// your service account.
+	client := conf.Client(oauth2.NoContext)
 
-	client := (&jwt.Transport{jwtToken, oauthToken, http.DefaultTransport}).Client()
+	//jwtToken := jwt.NewToken(os.Getenv(gcsIssEnvVar), gcs.DevstorageRead_writeScope, []byte(os.Getenv(gcsKeyEnvVar)))
+	//oauthToken, err := jwtToken.Assert(http.DefaultClient)
+	//if err != nil {
+	//	return err
+	//}
+
+	//client := (&jwt.Transport{jwtToken, oauthToken, http.DefaultTransport}).Client()
 
 	service, err := gcs.New(client)
 	if err != nil {

@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
+	"strings"
 
 	"github.com/garyburd/redigo/redis"
 	"github.com/twinj/uuid"
@@ -20,7 +22,7 @@ const (
 )
 
 var (
-	permissionsByKey map[string]map[string]bool
+	permissionsByKey map[string]map[string]string
 )
 
 func init() {
@@ -34,48 +36,133 @@ func authInit() error {
 		return err
 	}
 
-	permissionsByKey = make(map[string]map[string]bool)
+	permissionsByKey = make(map[string]map[string]string)
 
 	// Set up permissions for when there's no API key
-	permissionsByKey[""] = make(map[string]bool)
-	permissionsByKey[""][GetPermission] = !Config.authorisedGet
-	permissionsByKey[""][UploadPermission] = !Config.authorisedUpload
+	permissionsByKey[""] = make(map[string]string)
+	permissionsByKey[""][GetPermission] = Config.authorisedGet
+	permissionsByKey[""][UploadPermission] = Config.authorisedUpload
 
-	// Set up permissions for API keys
+	// Set up get permissions for API keys
 	for _, key := range keys {
-		permissions, err := infoAboutKey(key)
+		permissionsByKey[key] = make(map[string]string)
+		getPermissions, err := infoAboutKey(key, "get")
 		if err != nil {
 			return err
 		}
-		permissionsByKey[key] = make(map[string]bool)
-		for _, permission := range permissions {
-			permissionsByKey[key][permission] = true
+		uploadPermissions, err := infoAboutKey(key, "upload")
+		if err != nil {
+			return err
+		}
+
+		for i, getPermission := range getPermissions {
+			if i == 0 {
+				permissionsByKey[key]["get"] = getPermission
+			} else {
+				permissionsByKey[key]["get"] = fmt.Sprintf("%s,%s", permissionsByKey[key]["get"], getPermission)
+			}
+		}
+
+		for i, uploadPermission := range uploadPermissions {
+			if i == 0 {
+				permissionsByKey[key]["upload"] = uploadPermission
+			} else {
+				permissionsByKey[key]["upload"] = fmt.Sprintf("%s,%s", permissionsByKey[key]["upload"], uploadPermission)
+			}
 		}
 	}
 
 	return nil
 }
 
-func hasPermission(key, permission string) bool {
+func hasPermission(key, permission, prefix string) bool {
 	val, ok := permissionsByKey[key][permission]
 	if ok {
-		return val
+		return strings.Contains(val, prefix)
 	}
 	return false
 }
 
-func generateKey() (string, string, error) {
+func generateKey(getPrefixes, uploadPrefixes []string) (string, string, error) {
 	key := uuid.NewV4().String()
 	secretKey := uuid.NewV4().String()
 	_, err := Conn.Do("SADD", "api-keys", key)
 	if err != nil {
-		return "", "", err
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return "", "", fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		_, err := Conn.Do("SADD", "api-keys", key)
+		if err != nil {
+			return "", "", err
+		}
 	}
 	_, err = Conn.Do("HSET", "key:"+key, "secret", secretKey)
 	if err != nil {
-		return "", "", err
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return "", "", fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		_, err = Conn.Do("HSET", "key:"+key, "secret", secretKey)
+		if err != nil {
+			return "", "", err
+		}
 	}
-	_, err = Conn.Do("SADD", "key:"+key+":permissions", GetPermission, UploadPermission)
+	if permissionsByKey != nil {
+		permissionsByKey[key] = make(map[string]string)
+	} else {
+		permissionsByKey = make(map[string]map[string]string)
+		permissionsByKey[key] = make(map[string]string)
+	}
+	args := []interface{}{"key:" + key + ":permissions:" + GetPermission}
+	for i, getPrefix := range getPrefixes {
+		args = append(args, getPrefix)
+		if i == 0 {
+			permissionsByKey[key]["get"] = getPrefix
+		} else {
+			permissionsByKey[key]["get"] = fmt.Sprintf("%s,%s", permissionsByKey[key]["get"], getPrefix)
+		}
+	}
+	if len(args) > 1 {
+		_, err = Conn.Do("SADD", args...)
+	}
+	if err != nil {
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return "", "", fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		_, err = Conn.Do("SADD", args...)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	args = []interface{}{"key:" + key + ":permissions:" + UploadPermission}
+	for i, uploadPrefix := range uploadPrefixes {
+		args = append(args, uploadPrefix)
+		if i == 0 {
+			permissionsByKey[key]["upload"] = uploadPrefix
+		} else {
+			permissionsByKey[key]["upload"] = fmt.Sprintf("%s,%s", permissionsByKey[key]["upload"], uploadPrefix)
+		}
+	}
+	if len(args) > 1 {
+		_, err = Conn.Do("SADD", args...)
+		if err != nil {
+			redisCleanUp()
+			err2 := redisInit()
+			if err2 != nil {
+				log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+				return key, secretKey, fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			}
+			_, err = Conn.Do("SADD", args...)
+		}
+	}
 	return key, secretKey, err
 }
 
@@ -88,30 +175,58 @@ func generateSecret(key string) (string, error) {
 	secretKey := uuid.NewV4().String()
 	_, err = Conn.Do("HSET", "key:"+key, "secret", secretKey)
 	if err != nil {
-		return "", err
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return "", fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		_, err = Conn.Do("HSET", "key:"+key, "secret", secretKey)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	return secretKey, nil
 }
 
-func infoAboutKey(key string) ([]string, error) {
+func infoAboutKey(key string, permissionType string) ([]string, error) {
 	err := checkKeyExists(key)
 	if err != nil {
 		return nil, err
 	}
-	permissions, err := redis.Strings(Conn.Do("SMEMBERS", "key:"+key+":permissions"))
+	permissions, err := redis.Strings(Conn.Do("SMEMBERS", "key:"+key+":permissions:"+permissionType))
 	if err != nil {
-		return nil, err
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return nil, fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		permissions, err = redis.Strings(Conn.Do("SMEMBERS", "key:"+key+":permissions:"+permissionType))
+		if err != nil {
+			return nil, err
+		}
 	}
 	sort.Strings(permissions)
 	return permissions, nil
 }
 
 func listKeys() ([]string, error) {
-	return redis.Strings(Conn.Do("SMEMBERS", "api-keys"))
+	keys, err := redis.Strings(Conn.Do("SMEMBERS", "api-keys"))
+	if err != nil {
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return keys, fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		return redis.Strings(Conn.Do("SMEMBERS", "api-keys"))
+	}
+	return keys, err
 }
 
-func modifyKey(key, op, permission string) error {
+func modifyKey(key, op, permissionType, permission string) error {
 	err := checkKeyExists(key)
 	if err != nil {
 		return err
@@ -119,13 +234,39 @@ func modifyKey(key, op, permission string) error {
 	if op != "add" && op != "remove" {
 		return errors.New("modifier needs to be 'add' or 'remove'")
 	}
-	if permission != GetPermission && permission != UploadPermission {
-		return fmt.Errorf("modifier needs to end with a valid permission: %s or %s", GetPermission, UploadPermission)
+	if permissionType != GetPermission && permissionType != UploadPermission {
+		return fmt.Errorf("modifier needs to end with a valid permissionType: %s or %s", GetPermission, UploadPermission)
 	}
 	if op == "add" {
-		_, err = Conn.Do("SADD", "key:"+key+":permissions", permission)
+		_, err = Conn.Do("SADD", "key:"+key+":permissions:"+permissionType, permission)
+		if err != nil {
+			redisCleanUp()
+			err2 := redisInit()
+			if err2 != nil {
+				log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			} else {
+				_, err = Conn.Do("SADD", "key:"+key+":permissions:"+permissionType, permission)
+			}
+		}
+
+		if permissionsByKey[key][permissionType] != "" {
+			permissionsByKey[key][permissionType] = fmt.Sprintf("%s,%s", permissionsByKey[key][permissionType], permission)
+		} else {
+			permissionsByKey[key][permissionType] = permission
+		}
 	} else {
-		_, err = Conn.Do("SREM", "key:"+key+":permissions", permission)
+		_, err = Conn.Do("SREM", "key:"+key+":permissions:"+permissionType, permission)
+		if err != nil {
+			redisCleanUp()
+			err2 := redisInit()
+			if err2 != nil {
+				log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			} else {
+				_, err = Conn.Do("SREM", "key:"+key+":permissions:"+permissionType, permission)
+			}
+		}
+		permissionsByKey[key][permissionType] = strings.Replace(permissionsByKey[key][permissionType], permission+",", "", 1) //if it is at the beginning or middle
+		permissionsByKey[key][permissionType] = strings.Replace(permissionsByKey[key][permissionType], permission, "", 1)     //if it is at the end
 	}
 	return err
 }
@@ -137,9 +278,42 @@ func removeKey(key string) error {
 	}
 	_, err = Conn.Do("SREM", "api-keys", key)
 	if err != nil {
-		return err
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		_, err = Conn.Do("SREM", "api-keys", key)
+		if err != nil {
+			return err
+		}
 	}
-	_, err = Conn.Do("DEL", "key:"+key+":permissions")
+	_, err = Conn.Do("DEL", "key:"+key+":permissions:get")
+	if err != nil {
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		_, err = Conn.Do("DEL", "key:"+key+":permissions:get")
+		if err != nil {
+			return err
+		}
+	}
+	_, err = Conn.Do("DEL", "key:"+key+":permissions:upload")
+	if err != nil {
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		} else {
+			_, err = Conn.Do("DEL", "key:"+key+":permissions:upload")
+		}
+	}
+	permissionsByKey[key] = nil
 	return err
 }
 
@@ -150,8 +324,18 @@ func getSecretForKey(key string) (string, error) {
 	}
 
 	secret, err := redis.String(Conn.Do("HGET", "key:"+key, "secret"))
+
 	if err != nil {
-		return "", err
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return "", fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		secret, err = redis.String(Conn.Do("HGET", "key:"+key, "secret"))
+		if err != nil {
+			return "", err
+		}
 	}
 
 	return secret, nil
@@ -164,7 +348,16 @@ func authPermissionsOptions() string {
 func checkKeyExists(key string) error {
 	exists, err := redis.Bool(Conn.Do("SISMEMBER", "api-keys", key))
 	if err != nil {
-		return err
+		redisCleanUp()
+		err2 := redisInit()
+		if err2 != nil {
+			log.Printf("Reconnecting to redis failed: %s after error: %s", err2, err)
+			return fmt.Errorf("Reconnecting to redis failed: %s after error: %s", err2, err)
+		}
+		exists, err = redis.Bool(Conn.Do("SISMEMBER", "api-keys", key))
+		if err != nil {
+			return err
+		}
 	}
 	if !exists {
 		return fmt.Errorf("key does not exist")

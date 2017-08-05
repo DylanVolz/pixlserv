@@ -19,13 +19,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/PuerkitoBio/throttled"
-	"github.com/PuerkitoBio/throttled/store"
 	"github.com/codegangsta/cli"
 	"github.com/go-martini/martini"
 	"github.com/martini-contrib/binding"
 	"github.com/martini-contrib/cors"
+	"github.com/martini-contrib/secure"
 	"github.com/tgulacsi/go/temp"
+	"gopkg.in/throttled/throttled.v2"
+	"gopkg.in/throttled/throttled.v2/store"
 )
 
 // UploadForm is a form structure to use when an image is POSTed to the server
@@ -62,7 +63,7 @@ func main() {
 	app.Commands = []cli.Command{
 		{
 			Name:  "run",
-			Usage: "Runs the server (run [config-file])",
+			Usage: "Runs the server (run [config-file] [server-name])",
 			Action: func(c *cli.Context) {
 				// Set up logging for server
 				log.SetPrefix("[pixlserv] ")
@@ -71,7 +72,9 @@ func main() {
 					log.Println("You need to provide a path to a config file")
 					return
 				}
+				log.Printf("%+v",c.Args())
 				configFilePath := c.Args().First()
+				serverName := c.Args()[1]
 
 				// Initialise configuration
 				err := configInit(configFilePath)
@@ -79,6 +82,7 @@ func main() {
 					log.Println("Configuration reading failed:", err)
 					return
 				}
+				log.Printf("Running with server name: %s", serverName)
 				log.Printf("Running with config: %+v", Config)
 
 				// Initialise authentication
@@ -97,10 +101,20 @@ func main() {
 
 				// Run the server
 				m := martini.Classic()
+
+				martini.Env = martini.Prod
+				sslHost := fmt.Sprintf("%s:8443",serverName)
+				m.Use(secure.Secure(secure.Options{
+					SSLRedirect: true,
+					SSLHost:     sslHost,
+				}))
+
 				if Config.throttlingRate > 0 {
 					m.Use(throttler(Config.throttlingRate))
 				}
 				m.Use(func(res http.ResponseWriter, req *http.Request) {
+					log.Println("in the use call...")
+					log.Printf("%+v\n", req)
 					if uploadURLRe.MatchString(req.URL.Path) {
 						// The upload handler returns JSON
 						res.Header().Set("Content-Type", "application/json")
@@ -114,9 +128,16 @@ func main() {
 				m.Get("/", func() string {
 					return "It works!"
 				})
-				m.Get("/((?P<apikey>[A-Z0-9]+)/)?image/:parameters/**", transformationHandler)
-				m.Post("/((?P<apikey>[A-Z0-9]+)/)?upload", binding.MultipartForm(UploadForm{}), uploadHandler)
-				go m.Run()
+				m.Get("/((?P<apikey>[a-z0-9]+)/)?image/:parameters/**", transformationHandler)
+				m.Post("/((?P<apikey>[a-z0-9]+)/)?upload", binding.MultipartForm(UploadForm{}), uploadHandler)
+				certPath := fmt.Sprintf("/etc/letsencrypt/live/%s/fullchain.pem",serverName)
+				keyPath := fmt.Sprintf("/etc/letsencrypt/live/%s/privkey.pem",serverName)
+				go func() {
+					if err := http.ListenAndServeTLS(":8443", certPath, keyPath, m); err != nil {
+						fmt.Println(err)
+					}
+				}()
+				go runKeyManager()
 
 				// Wait for when the program is terminated
 				ch := make(chan os.Signal)
@@ -136,7 +157,13 @@ func main() {
 					Name:  "add",
 					Usage: "Adds a new one",
 					Action: func(c *cli.Context) {
-						key, secretKey, err := generateKey()
+						permissionsSet := c.Args()
+						if permissionsSet[0] != GetPermission {
+
+							return
+						}
+
+						key, secretKey, err := generateKey(permissionsSet[1:], permissionsSet[:])
 						if err != nil {
 							log.Println("Adding a new API key failed, please try again")
 							return
@@ -170,14 +197,18 @@ func main() {
 							log.Println("You need to provide an existing key")
 							return
 						}
+						permissionTypes := []string{GetPermission, UploadPermission}
+
 						key := c.Args().First()
-						permissions, err := infoAboutKey(key)
-						if err != nil {
-							log.Println(err.Error())
-							return
-						}
 						log.Println("Key:", key)
-						log.Println("Permissions:", permissions)
+						for _, permissionType := range permissionTypes {
+							permissions, err := infoAboutKey(key, permissionType)
+							if err != nil {
+								log.Println(err.Error())
+								return
+							}
+							log.Printf("%s Permissions: %v", permissionType, permissions)
+						}
 					},
 				},
 				{
@@ -195,14 +226,14 @@ func main() {
 				},
 				{
 					Name:  "modify",
-					Usage: "Modifies permissions for a key (modify [key] [add/remove] [" + authPermissionsOptions() + "])",
+					Usage: "Modifies permissions for a key (modify [key] [add/remove] [get/upload] [prefix])",
 					Action: func(c *cli.Context) {
-						if len(c.Args()) < 3 {
-							log.Println("You need to provide an existing key, operation and a permission")
+						if len(c.Args()) < 4 {
+							log.Println("You need to provide an existing key, operation, permissionType and a permission")
 							return
 						}
 						key := c.Args().First()
-						err := modifyKey(key, c.Args()[1], c.Args()[2])
+						err := modifyKey(key, c.Args()[1], c.Args()[2], c.Args()[3])
 						if err != nil {
 							log.Println(err.Error())
 							return
@@ -234,8 +265,10 @@ func main() {
 }
 
 func transformationHandler(params martini.Params) (int, string) {
-	if !hasPermission(params["apikey"], GetPermission) {
-		return http.StatusUnauthorized, ""
+	baseImagePath, scale := parseBasePathAndScale(params["_1"])
+	prefix := strings.Split(baseImagePath, "_")[0]
+	if !hasPermission(params["apikey"], GetPermission, prefix) {
+		return http.StatusUnauthorized, prefix
 	}
 
 	var transformation Transformation
@@ -255,7 +288,7 @@ func transformationHandler(params martini.Params) (int, string) {
 	} else {
 		return http.StatusBadRequest, "Custom transformations not allowed"
 	}
-	baseImagePath, scale := parseBasePathAndScale(params["_1"])
+	//baseImagePath, scale := parseBasePathAndScale(params["_1"])
 	if Config.allowCustomScale {
 		parameters := transformation.params.WithScale(scale)
 		transformation.params = &parameters
@@ -326,7 +359,14 @@ func uploadSuccess(imagePath string) string {
 }
 
 func uploadHandler(params martini.Params, uf UploadForm) (int, string) {
-	if !hasPermission(params["apikey"], UploadPermission) {
+	log.Println("Entered Upload")
+	split := strings.Split(uf.PhotoUpload.Filename, "/")
+	fileName := split[len(split)-1]
+	uploadPrefix := strings.Split(fileName, "_")[1]
+
+	fmt.Printf("checking uploadPrefix %s", uploadPrefix)
+
+	if !hasPermission(params["apikey"], UploadPermission, uploadPrefix) {
 		return http.StatusUnauthorized, uploadError("API key invalid or missing")
 	}
 
@@ -351,8 +391,9 @@ func uploadHandler(params martini.Params, uf UploadForm) (int, string) {
 		if err != nil {
 			return http.StatusBadRequest, uploadError("authorization error")
 		}
+		log.Printf("secret loaded from redis is: %s/n", secret)
 		if !isValidSignature(uf.Signature, secret, queryParams) {
-			return http.StatusBadRequest, uploadError("invalid signature")
+			return http.StatusBadRequest, uploadError(fmt.Sprintf("invalid signature: %s", uf.Signature))
 		}
 	}
 
@@ -394,9 +435,8 @@ func uploadHandler(params martini.Params, uf UploadForm) (int, string) {
 	defer file.Close()
 
 	// Not a big fan of .jpeg file extensions
-	now := time.Now()
-	randomInt := rand.Intn(1000)
-	baseImagePath := fmt.Sprintf("%d-%d.%s", now.Unix(), randomInt, strings.Replace(format, "jpeg", "jpg", 1))
+
+	baseImagePath := strings.Replace(fileName, "jpeg", "jpg", 1)
 	log.Printf("Uploading %s", baseImagePath)
 
 	// Eager transformations

@@ -6,7 +6,7 @@ import (
 	"os"
 	"regexp"
 
-	"code.google.com/p/freetype-go/freetype"
+	"github.com/golang/freetype"
 
 	"github.com/ReshNesh/go-colorful"
 	"gopkg.in/yaml.v1"
@@ -28,8 +28,8 @@ const (
 	defaultAllowCustomTransformations = true
 	defaultAllowCustomScale           = true
 	defaultAsyncUploads               = false
-	defaultAuthorisedGet              = false
-	defaultAuthorisedUpload           = false
+	defaultAuthorisedGet              = "public"
+	defaultAuthorisedUpload           = ""
 	defaultLocalPath                  = "local-images"
 	defaultCacheStrategy              = LRU
 	defaultFontPath                   = "fonts/DejaVuSans.ttf"
@@ -42,12 +42,12 @@ var (
 
 // Configuration specifies server configuration options
 type Configuration struct {
-	throttlingRate, cacheLimit, jpegQuality, uploadMaxFileSize, uploadMaxPixels                 int
-	allowCustomTransformations, allowCustomScale, asyncUploads, authorisedGet, authorisedUpload bool
-	localPath, cacheStrategy                                                                    string
-	corsAllowOrigins                                                                            []string
-	transformations                                                                             map[string]Transformation
-	eagerTransformations                                                                        []Transformation
+	throttlingRate, cacheLimit, jpegQuality, uploadMaxFileSize, uploadMaxPixels int
+	allowCustomTransformations, allowCustomScale, asyncUploads                  bool
+	authorisedGet, authorisedUpload, localPath, cacheStrategy                   string
+	corsAllowOrigins                                                            []string
+	transformations                                                             map[string]Transformation
+	eagerTransformations                                                        []Transformation
 }
 
 func configInit(configFilePath string) error {
@@ -105,11 +105,11 @@ func configInit(configFilePath string) error {
 
 	authorisation, ok := m["authorisation"].(map[interface{}]interface{})
 	if ok {
-		get, ok := authorisation["get"].(bool)
+		get, ok := authorisation["get"].(string)
 		if ok {
 			Config.authorisedGet = get
 		}
-		upload, ok := authorisation["upload"].(bool)
+		upload, ok := authorisation["upload"].(string)
 		if ok {
 			Config.authorisedUpload = upload
 		}
